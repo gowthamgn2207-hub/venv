@@ -18,6 +18,7 @@ from datetime import date, datetime
 from flask import (Flask, abort, flash, g, has_request_context, jsonify, redirect, render_template, request,
                    session, url_for)
 from jinja2 import DictLoader
+from markupsafe import escape
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import charts
@@ -44,12 +45,16 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax",
                   SESSION_COOKIE_SECURE=os.environ.get("HTTPS_ONLY", "0") == "1")
 
 
+CONFIG_PROBLEMS = []
+
+
 def _secret():
     if os.environ.get("SECRET_KEY"):
         return os.environ["SECRET_KEY"]
     if os.environ.get("VERCEL"):
-        raise RuntimeError("Set the SECRET_KEY environment variable in Vercel (Project Settings > Environment Variables), "
-                           "otherwise logins break between serverless instances.")
+        CONFIG_PROBLEMS.append("SECRET_KEY is missing. In Vercel open Project > Settings > Environment Variables, add "
+                               "SECRET_KEY (any long random text), then redeploy.")
+        return secrets.token_hex(32)
     path = os.path.join(BASE_DIR, "secret.key")
     try:
         with open(path) as f:
@@ -74,6 +79,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") 
 USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 if USE_PG and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+if os.environ.get("VERCEL") and not USE_PG:
+    CONFIG_PROBLEMS.append("No database is connected (DATABASE_URL is missing). In Vercel open your project > Storage, "
+                           "create a Neon database and click Connect Project, then Redeploy.")
 if USE_PG:
     import psycopg
     from psycopg.rows import dict_row
@@ -100,7 +108,8 @@ class _PGCursor:
 
 class _PGConn:
     def __init__(self):
-        self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15)
+        self.raw = psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=15,
+                                  prepare_threshold=None)  # safe behind Neon's connection pooler
 
     def execute(self, sql, params=()):
         sql = sql.replace("?", "%s")
@@ -247,6 +256,12 @@ def csrf_token():
 @app.before_request
 def protect():
     g.user = None
+    problem = ensure_ready()
+    if problem:
+        return (f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                f"<body style='font-family:system-ui;max-width:640px;margin:8vh auto;padding:0 16px'>"
+                f"<h2>FinTrack is not set up yet</h2><p>{escape(problem)}</p>"
+                f"<p style='color:#6b7280'>Fix this in your hosting settings and reload the page.</p></body>", 503)
     uid = session.get("uid")
     if uid:
         with db() as con:
@@ -596,10 +611,32 @@ def demo_clear():
     return redirect(url_for("dashboard"))
 
 
-init_db()
-seed_demo_account()
+_ready, _ready_lock, _last_error = False, threading.Lock(), None
+
+
+def ensure_ready():
+    """Create tables + demo account once per server instance. Returns an error text, or None when ready."""
+    global _ready, _last_error
+    if CONFIG_PROBLEMS:
+        return " ".join(CONFIG_PROBLEMS)
+    if _ready:
+        return None
+    with _ready_lock:
+        if _ready:
+            return None
+        try:
+            init_db()
+            seed_demo_account()
+            _ready, _last_error = True, None
+        except Exception as e:  # shown on screen so the cause can be fixed without digging through logs
+            _last_error = f"Could not start the database: {type(e).__name__}: {str(e)[:300]}"
+            app.logger.exception("startup failed")
+    return None if _ready else _last_error
 
 if __name__ == "__main__":
+    err = ensure_ready()
+    if err:
+        raise SystemExit(err)
     port = int(os.environ.get("PORT", 5000))
     if not os.environ.get("NO_BROWSER"):
         threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
